@@ -65,6 +65,7 @@ import imaplib
 import datetime
 import re
 import smtplib
+import ssl
 
 # how long urlauths should be valid
 validity = datetime.timedelta(minutes=1)
@@ -151,11 +152,16 @@ class ProxyChannel(smtpd.SMTPChannel):
     def connect_imap(self):
         s = self.proxy_settings
         if s['imap_tls'] in ['tls', 'ssl']:
-            self.imap = imaplib.IMAP4_SSL(s['imap_host'], port=s['imap_port'])
+            context = ssl.create_default_context()
+            self.imap = imaplib.IMAP4_SSL(
+                s['imap_host'],
+                port=s['imap_port'],
+                ssl_context=context)
         else:
             self.imap = imaplib.IMAP4(s['imap_host'], port=s['imap_port'])
             if s['imap_tls'] == 'starttls':
-                print(self.imap.starttls())
+                context = ssl.create_default_context()
+                print(self.imap.starttls(ssl_context=context))
         print(self.imap.login(s['imap_username'], s['imap_password']))
 
     def store_message(self, data):
@@ -202,11 +208,16 @@ class ProxyChannel(smtpd.SMTPChannel):
     def connect_smtp(self):
         s = self.proxy_settings
         if s['smtp_tls'] in ['tls', 'ssl']:
-            self.smtp = smtplib.SMTP_SSL(s['smtp_host'], port=s['smtp_port'])
+            context = ssl.create_default_context()
+            self.smtp = smtplib.SMTP_SSL(
+                s['smtp_host'],
+                port=s['smtp_port'],
+                context=context)
         else:
             self.smtp = smtplib.SMTP(s['smtp_host'], port=s['smtp_port'])
             if s['smtp_tls'] == 'starttls':
-                print(self.smtp.starttls())
+                context = ssl.create_default_context()
+                print(self.smtp.starttls(context=context))
         print(self.smtp.login(s['smtp_username'], s['smtp_password']))
         code, data = self.smtp.ehlo()
         print((code, data))
