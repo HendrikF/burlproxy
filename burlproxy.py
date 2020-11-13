@@ -66,12 +66,25 @@ import datetime
 import re
 import smtplib
 import ssl
+import logging
 
 # how long urlauths should be valid
 validity = datetime.timedelta(minutes=1)
 
 # where we listen
 local_smtp = ('localhost', 1587)
+
+def setuplogging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    consolehandler = logging.StreamHandler()
+    consolehandler.setLevel(logging.DEBUG)
+    consoleformatter = logging.Formatter('%(name)s\t%(levelname)s\t%(message)s')
+    consolehandler.setFormatter(consoleformatter)
+    logger.addHandler(consolehandler)
+
+setuplogging()
 
 append_msgid_re = re.compile('\[APPENDUID \d+ (\d+)\]')
 fetch_uid_re = re.compile('\(UID (\d+)\)')
@@ -109,13 +122,15 @@ def decode_proxy_settings(s):
 
 class ProxyChannel(smtpd.SMTPChannel):
     def __init__(self, server, conn, addr, *args, **kw):
+        self.logger = logging.getLogger(str(addr))
+        self.logger.info('channel opened')
         super().__init__(server, conn, addr, *args, **kw)
         self.proxy_settings = None
         self.imap = None
         self.smtp = None
 
     def smtp_EHLO(self, arg):
-        print('smtp_EHLO', arg)
+        self.logger.info('EHLO from client: %s', arg)
         # from python source:
         # https://github.com/python/cpython/blob/master/Lib/smtpd.py
         if not arg:
@@ -142,6 +157,7 @@ class ProxyChannel(smtpd.SMTPChannel):
         self.push('250 HELP')
 
     def smtp_AUTH(self, arg):
+        self.logger.info('AUTH')
         arg = arg[len(b'PLAIN '):]
         username, password = decode_auth_plain(arg)
         proxy_settings = decode_proxy_settings(password)
@@ -150,6 +166,7 @@ class ProxyChannel(smtpd.SMTPChannel):
         self.push('250 OK')
 
     def connect_imap(self):
+        self.logger.info('connecting to imap server')
         s = self.proxy_settings
         if s['imap_tls'] in ['tls', 'ssl']:
             context = ssl.create_default_context()
@@ -161,30 +178,33 @@ class ProxyChannel(smtpd.SMTPChannel):
             self.imap = imaplib.IMAP4(s['imap_host'], port=s['imap_port'])
             if s['imap_tls'] == 'starttls':
                 context = ssl.create_default_context()
-                print(self.imap.starttls(ssl_context=context))
-        print(self.imap.login(s['imap_username'], s['imap_password']))
+                self.logger.info('starttls to imap: %s', self.imap.starttls(ssl_context=context))
+        self.logger.info('logging in: %s', self.imap.login(s['imap_username'], s['imap_password']))
 
     def store_message(self, data):
+        self.logger.info('storing message')
         s = self.proxy_settings
         now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
         typ, data = self.imap.append(s['imap_mailbox'], '\Seen', now, data)
-        print((typ, data))
+        self.logger.info('append: %s', (typ, data))
         msgid = append_msgid_re.search(data[0].decode()).group(1)
-        print('created msgid', msgid)
+        self.logger.info('got msgid: %s', msgid)
         return msgid
 
     def gen_urlauth(self, msgid):
+        self.logger.info('retrieving urlauth token')
         s = self.proxy_settings
-        print(self.imap.select(s['imap_mailbox']))
+        self.logger.info('selecting mailbox: %s %s', s['imap_mailbox'], self.imap.select(s['imap_mailbox']))
+        # I thought, that we need a uid instead of a msgid, but I guess not
         #typ, data = self.imap.fetch(msgid, '(UID)')
         #print((typ, data))
         #uid = fetch_uid_re.search(data[0].decode()).group(1)
         uid = msgid
-        print('found uid', uid)
+        self.logger.info('found uid: %s', uid)
         now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
         expire = now + validity
         expire_str = expire.isoformat(timespec='seconds')
-        print('expiration', expire_str)
+        self.logger.info('token will expire on: %s', expire_str)
         command = 'GENURLAUTH "imap://{username};AUTH=*@{host}/{mailbox}/;UID={uid};EXPIRE={expire};URLAUTH=submit+{username}" INTERNAL\r\n'.format(
             username=urllib.parse.quote(s['imap_username']),
             host=s['imap_host'],
@@ -193,6 +213,7 @@ class ProxyChannel(smtpd.SMTPChannel):
             expire=expire_str
         )
         tag = b'bp00 '
+        self.logger.info('sending GENURLAUTH: %s', command)
         self.imap.send(tag + command.encode())
         response = ''
         while True:
@@ -201,11 +222,12 @@ class ProxyChannel(smtpd.SMTPChannel):
             if line.startswith(tag):
                 break
         urlauth = genurlauth_re.search(response).group(1)
-        print('got urlauth', urlauth)
-        print(self.imap.close())
+        self.logger.info('got urlauth: %s', urlauth)
+        self.logger.info('closing imap: %s', self.imap.close())
         return urlauth
 
     def connect_smtp(self):
+        self.logger.info('connecting to submission server')
         s = self.proxy_settings
         if s['smtp_tls'] in ['tls', 'ssl']:
             context = ssl.create_default_context()
@@ -217,36 +239,36 @@ class ProxyChannel(smtpd.SMTPChannel):
             self.smtp = smtplib.SMTP(s['smtp_host'], port=s['smtp_port'])
             if s['smtp_tls'] == 'starttls':
                 context = ssl.create_default_context()
-                print(self.smtp.starttls(context=context))
-        print(self.smtp.login(s['smtp_username'], s['smtp_password']))
-        code, data = self.smtp.ehlo()
-        print((code, data))
+                self.logger.info('starttls to submission: %s', self.smtp.starttls(context=context))
+        self.logger.info('logging in: %s', self.smtp.login(s['smtp_username'], s['smtp_password']))
+        typ, data = self.smtp.ehlo()
+        self.logger.info('EHLO to submission: %s', (typ, data))
         if b'BURL' not in data:
-            print('WARNING: smtp server does not advertise burl capability')
+            self.logger.warn('smtp server does not advertise BURL capability')
 
     def send_message(self, mailfrom, rcpttos, urlauth):
-        print(mailfrom, rcpttos)
-        print(self.smtp.docmd('MAIL', 'FROM:<{fr}>'.format(fr=mailfrom)))
+        self.logger.info('mail from: %s %s', mailfrom, self.smtp.docmd('MAIL', 'FROM:<{fr}>'.format(fr=mailfrom)))
         for rcpt in rcpttos:
-            print(self.smtp.docmd('RCPT', 'TO:<{to}>'.format(to=rcpt)))
+            self.logger.info('rcpt to: %s %s', rcpt, self.smtp.docmd('RCPT', 'TO:<{to}>'.format(to=rcpt)))
         code, data = self.smtp.docmd('BURL', '{urlauth} LAST'.format(
             urlauth=urlauth
         ))
-        print((code, data))
+        self.logger.info('burl: %s', (code, data))
         return '{code} {data}'.format(
             code=code,
             data=data
         )
 
     def process_message(self, peer, mailfrom, rcpttos, data, **kw):
-        print('process_message', peer, mailfrom, rcpttos, kw)
+        self.logger.info('processing message: %s %s %s %s', peer, mailfrom, rcpttos, kw)
         self.connect_imap()
         msgid = self.store_message(data)
         urlauth = self.gen_urlauth(msgid)
-        print(self.imap.logout())
+        self.logger.info('logging out of imap: %s', self.imap.logout())
         self.connect_smtp()
         result = self.send_message(mailfrom, rcpttos, urlauth)
-        print(self.smtp.quit())
+        self.logger.info('quitting smtp: %s', self.smtp.quit())
+        self.logger.info('DONE')
         return result
 
     # from python source:
@@ -316,8 +338,10 @@ class BurlProxy(smtpd.SMTPServer):
     channel_class = ProxyChannel
 
     def __init__(self, *args, **kw):
+        self.logger = logging.getLogger(self.__class__.__name__)
         kw['enable_SMTPUTF8'] = True
         super().__init__(*args, **kw)
+        self.logger.info('ready')
 
 def main(local_smtp):
     proxy = BurlProxy(local_smtp, ('', 0))
@@ -330,4 +354,3 @@ def main(local_smtp):
 
 if __name__ == '__main__':
     main(local_smtp)
-
